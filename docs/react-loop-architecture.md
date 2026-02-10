@@ -15,15 +15,24 @@ through the LLM flow loop, tool dispatch, event propagation, and session persist
 4. [InvocationContext: The Central State Container](#4-invocationcontext-the-central-state-container)
 5. [The Core ReAct Loop](#5-the-core-react-loop)
 6. [Request Preprocessing Pipeline](#6-request-preprocessing-pipeline)
-7. [LLM Invocation and Model Callbacks](#7-llm-invocation-and-model-callbacks)
-8. [Postprocessing and Tool Dispatch](#8-postprocessing-and-tool-dispatch)
-9. [Tool Execution System](#9-tool-execution-system)
-10. [Event System and Propagation](#10-event-system-and-propagation)
-11. [Agent Transfer and Multi-Agent Orchestration](#11-agent-transfer-and-multi-agent-orchestration)
-12. [Callback Architecture](#12-callback-architecture)
-13. [Flow Variants: SingleFlow vs AutoFlow](#13-flow-variants-singleflow-vs-autoflow)
-14. [End-to-End Execution Example](#14-end-to-end-execution-example)
-15. [Key File Reference](#15-key-file-reference)
+7. [Response Processing Pipeline](#7-response-processing-pipeline)
+8. [LLM Invocation and Model Callbacks](#8-llm-invocation-and-model-callbacks)
+9. [Postprocessing and Tool Dispatch](#9-postprocessing-and-tool-dispatch)
+10. [Tool Execution System](#10-tool-execution-system)
+11. [Event System and Propagation](#11-event-system-and-propagation)
+12. [Agent Transfer and Multi-Agent Orchestration](#12-agent-transfer-and-multi-agent-orchestration)
+13. [Callback Architecture](#13-callback-architecture)
+14. [Plugin System](#14-plugin-system)
+15. [Planner Integration](#15-planner-integration)
+16. [Code Execution Integration](#16-code-execution-integration)
+17. [Streaming and Partial Events](#17-streaming-and-partial-events)
+18. [Invocation Cost Management](#18-invocation-cost-management)
+19. [Resumability and Long-Running Tools](#19-resumability-and-long-running-tools)
+20. [Event Compaction](#20-event-compaction)
+21. [Output Schema Enforcement](#21-output-schema-enforcement)
+22. [Flow Variants: SingleFlow vs AutoFlow](#22-flow-variants-singleflow-vs-autoflow)
+23. [End-to-End Execution Example](#23-end-to-end-execution-example)
+24. [Key File Reference](#24-key-file-reference)
 
 ---
 
@@ -376,7 +385,54 @@ request processors in order:
 
 ---
 
-## 7. LLM Invocation and Model Callbacks
+## 7. Response Processing Pipeline
+
+After the LLM call returns but before function calls are dispatched, registered
+`BaseLlmResponseProcessor` instances run. Both `SingleFlow` and `AutoFlow` register
+exactly two response processors in this order:
+
+| # | Processor | File | Purpose |
+|---|---|---|---|
+| 1 | NL Planning | `_nl_planning.py` | Post-process planning tags in model output |
+| 2 | Code Execution | `_code_execution.py` | Extract and execute code blocks from model output |
+
+`AutoFlow` does **not** add any additional response processors — it inherits the same
+two from `SingleFlow`.
+
+### NL Planning Response Processor
+
+Activated only when the agent has a non-`BuiltInPlanner` planner configured:
+
+1. Calls `planner.process_planning_response()` to identify planning tags in the
+   response (`/*PLANNING*/`, `/*REPLANNING*/`, `/*REASONING*/`, `/*ACTION*/`,
+   `/*FINAL_ANSWER*/`).
+2. Marks reasoning/planning parts as "thought" content so they are hidden from the
+   user but retained in context.
+3. If the planner produces state deltas, emits a state update event.
+
+For `BuiltInPlanner`, this processor is a no-op because built-in planning uses
+the model's native `ThinkingConfig` instead.
+
+### Code Execution Response Processor
+
+Handles two distinct executor types:
+
+**BuiltInCodeExecutor** (Gemini-native):
+- Processes generated images by saving them as artifacts.
+- Removes inline base64 image data and replaces with artifact references.
+
+**BaseCodeExecutor** (custom executors):
+- Extracts the first code block from the model response text.
+- Executes the code via `code_executor.execute_code()`.
+- Saves output files as artifacts.
+- **Crucially, sets `llm_response.content = None`** after execution. This forces the
+  ReAct loop to continue: the next iteration sends the execution results (stdout,
+  stderr) back to the LLM for interpretation.
+- Enforces `error_retry_attempts` to limit retries on execution failures.
+
+---
+
+## 8. LLM Invocation and Model Callbacks
 
 The LLM call is managed by `_call_llm_async()` in `BaseLlmFlow`:
 
@@ -407,7 +463,7 @@ an `LlmResponse`, enabling patterns like response caching, mocking, or guardrail
 
 ---
 
-## 8. Postprocessing and Tool Dispatch
+## 9. Postprocessing and Tool Dispatch
 
 After the LLM responds, `_postprocess_async()` handles the response:
 
@@ -456,7 +512,7 @@ the feedback cycle.
 
 ---
 
-## 9. Tool Execution System
+## 10. Tool Execution System
 
 ### Tool Class Hierarchy
 
@@ -578,7 +634,7 @@ Tools with `is_long_running=True`:
 
 ---
 
-## 10. Event System and Propagation
+## 11. Event System and Propagation
 
 ### Event Structure
 
@@ -640,7 +696,7 @@ An event is considered a final response when:
 
 ---
 
-## 11. Agent Transfer and Multi-Agent Orchestration
+## 12. Agent Transfer and Multi-Agent Orchestration
 
 ### Transfer Mechanism
 
@@ -671,7 +727,7 @@ ensuring agents only see their own conversation context.
 
 ---
 
-## 12. Callback Architecture
+## 13. Callback Architecture
 
 The ADK provides callbacks at three levels, each following a consistent pattern:
 **plugins execute first** (highest priority), then **agent-level callbacks**. The
@@ -722,7 +778,248 @@ All callbacks support both sync and async variants (detected and awaited automat
 
 ---
 
-## 13. Flow Variants: SingleFlow vs AutoFlow
+## 14. Plugin System
+
+Plugins (`src/google/adk/plugins/base_plugin.py`) provide a cross-cutting extension
+mechanism that wraps the entire agent lifecycle. A `PluginManager`
+(`src/google/adk/plugins/plugin_manager.py`) executes registered plugins in order
+using an early-exit pattern: the first plugin to return a non-`None` value stops the
+chain and its return value is used.
+
+### Full Plugin Interface
+
+Plugins may implement any combination of these callbacks:
+
+| Category | Callback | When Invoked |
+|---|---|---|
+| **Lifecycle** | `on_user_message_callback()` | Modify user input before processing |
+| **Lifecycle** | `before_run_callback()` | Pre-invocation setup |
+| **Lifecycle** | `after_run_callback()` | Post-invocation cleanup |
+| **Event** | `on_event_callback()` | Intercept every yielded event |
+| **Agent** | `before_agent_callback()` | Before agent execution |
+| **Agent** | `after_agent_callback()` | After agent execution |
+| **Model** | `before_model_callback()` | Before each LLM call (can cache/override) |
+| **Model** | `after_model_callback()` | After each LLM response |
+| **Model** | `on_model_error_callback()` | Handle model errors |
+| **Tool** | `before_tool_callback()` | Validate/modify tool inputs |
+| **Tool** | `after_tool_callback()` | Modify tool outputs |
+| **Tool** | `on_tool_error_callback()` | Handle tool errors |
+
+### Execution Priority
+
+Plugins always execute **before** agent-level callbacks at every tier. Within the
+plugin list, execution is sequential in registration order. This means plugins can
+intercept and override behavior before the agent's own callbacks run.
+
+---
+
+## 15. Planner Integration
+
+The planner system adds structured reasoning capabilities to the ReAct loop without
+changing the loop structure itself. Planners integrate through the request/response
+processor pipeline.
+
+### BuiltInPlanner
+
+`BuiltInPlanner` (`src/google/adk/planners/built_in_planner.py`) uses the model's
+native thinking features:
+
+- **Request phase**: Sets `ThinkingConfig` on the LLM request (budget of thinking
+  tokens).
+- **Response phase**: No-op (thinking is handled natively by the model).
+- **Loop impact**: None — does not add extra iterations.
+
+### PlanReActPlanner
+
+`PlanReActPlanner` (`src/google/adk/planners/plan_re_act_planner.py`) uses prompt
+engineering for planning:
+
+- **Request phase**: Injects a detailed planning instruction via
+  `build_planning_instruction()`, telling the model to use structured planning tags.
+- **Response phase**: Parses response for tags (`/*PLANNING*/`, `/*REPLANNING*/`,
+  `/*REASONING*/`, `/*ACTION*/`, `/*FINAL_ANSWER*/`) and marks reasoning parts as
+  "thought" content to hide from the user while retaining in context.
+- **Loop impact**: None — works within a single LLM call per iteration.
+
+---
+
+## 16. Code Execution Integration
+
+Code execution adds a secondary action type to the ReAct loop: in addition to tool
+calls, the LLM can produce code blocks that the framework executes inline.
+
+### Request Phase
+
+The `_CodeExecutionRequestProcessor`:
+1. Extracts inline data files (CSV, etc.) from user messages and caches them.
+2. Runs `explore_df()` preprocessing on new data files.
+3. Injects preprocessing code into the LLM request.
+
+### Response Phase
+
+The `_CodeExecutionResponseProcessor` (for custom `BaseCodeExecutor`):
+1. Extracts the first code block from the model response.
+2. Executes it via `code_executor.execute_code()`.
+3. Captures stdout/stderr and output files.
+4. **Sets `llm_response.content = None`**, which causes the ReAct loop to continue.
+5. On the next iteration, execution results appear in the conversation history,
+   allowing the LLM to interpret them.
+
+This creates a **code-observe-reason** cycle within the broader ReAct loop:
+
+```
+LLM produces code → Execute → Clear response → LLM sees results → LLM reasons
+```
+
+---
+
+## 17. Streaming and Partial Events
+
+### Streaming Modes
+
+Controlled by `RunConfig.streaming_mode` (`src/google/adk/utils/run_config.py`):
+
+| Mode | Behavior |
+|---|---|
+| `NONE` | Single aggregated response per turn (default) |
+| `SSE` | Server-Sent Events: partial chunks + final aggregated event |
+| `BIDI` | Bidirectional streaming (used with Live API) |
+
+### Streaming in the ReAct Loop
+
+During `_call_llm_async()`, the model is always called with `stream=True`. In SSE
+mode:
+- Partial response chunks are yielded as events with `partial=True`.
+- After all chunks arrive, the final aggregated event is yielded with `partial=False`.
+- **Partial events do not terminate the loop** — the loop condition checks
+  `last_event.is_final_response()`, which returns `False` for partial events.
+- **Partial function calls are not executed** — if the model response event is
+  `partial`, the postprocessor returns immediately without dispatching tools.
+
+### Client-Side Considerations
+
+In SSE mode, clients receive both partial text chunks and the final aggregated text.
+Applications must filter events by the `partial` flag to avoid displaying text twice.
+
+### Live Mode
+
+`run_live()` differs significantly from `run_async()`:
+- Uses a bidirectional connection via `llm.connect()` and
+  `llm_connection.send()/receive()`.
+- Sends conversation history upfront when connecting.
+- Caches input/output audio chunks for transcription.
+- Supports transparent session resumption with handle tokens.
+- Executes tools in a thread pool (`ToolThreadPoolConfig`) to avoid blocking the
+  audio stream.
+
+---
+
+## 18. Invocation Cost Management
+
+The framework enforces a maximum number of LLM calls per invocation to prevent
+runaway loops.
+
+### Configuration
+
+`RunConfig.max_llm_calls` (default: 500). Values <= 0 disable enforcement (with a
+logged warning).
+
+### Enforcement
+
+A private `_InvocationCostManager` inside `InvocationContext` tracks the call count:
+
+1. Before each LLM call, `invocation_context.increment_llm_call_count()` is called.
+2. If the count exceeds `max_llm_calls`, a `LlmCallsLimitExceededError` is raised.
+3. This terminates the ReAct loop for the current invocation.
+
+This acts as a safety net against infinite tool-call cycles where the LLM never
+produces a final text response.
+
+---
+
+## 19. Resumability and Long-Running Tools
+
+### Long-Running Tool Detection
+
+During event finalization in `_postprocess_async()`, tools with
+`is_long_running=True` are identified and their IDs are stored in
+`event.long_running_tool_ids`.
+
+### Pause Mechanism
+
+After yielding the model response event, the flow checks
+`invocation_context.should_pause_invocation(event)`:
+
+- Returns `True` if: the context is resumable AND the event has long-running tool IDs
+  AND there are 2+ events in sequence.
+- When paused, the loop exits without executing the pending function calls.
+- The invocation's agent state is checkpointed in `EventActions.agent_state`.
+
+### Resume Mechanism
+
+When `Runner.run_async()` is called with an existing `invocation_id`:
+
+1. The runner rebuilds the `InvocationContext` from session history.
+2. It calls `populate_invocation_agent_states()` to restore agent checkpoints.
+3. In `_run_one_step_async()`, if the last event has pending function calls, the
+   flow **skips the LLM call** and goes directly to
+   `_postprocess_handle_function_calls_async()`.
+4. Tool results are then fed back through the normal loop.
+
+---
+
+## 20. Event Compaction
+
+Event compaction manages context window growth over long conversations.
+
+### Mechanism
+
+Implemented in `src/google/adk/apps/compaction.py` using a sliding window approach:
+
+1. **Trigger**: After `compaction_invocation_threshold` new invocations complete.
+2. **Window**: Selects events from completed invocations with an `overlap_size`
+   for continuity.
+3. **Summarization**: Uses `LlmEventSummarizer` to produce a compressed summary.
+4. **Storage**: Creates a `CompactedEvent` that replaces the raw events in context.
+
+### Integration with ReAct Loop
+
+Compaction runs **after** the agent finishes, not during the ReAct loop itself. The
+contents processor handles compacted events during preprocessing: it filters out
+events covered by compaction ranges and inserts the compacted summary in their place.
+
+Example with threshold=2, overlap=1:
+- First compaction covers invocations [1, 2]
+- Next compaction covers invocations [2, 3, 4] (overlap re-includes invocation 2)
+
+---
+
+## 21. Output Schema Enforcement
+
+When an agent defines `output_schema` (a Pydantic model), the framework ensures the
+LLM produces structured JSON output.
+
+### Challenge
+
+Some models cannot use both tools and structured output simultaneously. The output
+schema processor works around this limitation.
+
+### Implementation
+
+**Request phase** (`_OutputSchemaRequestProcessor`):
+- If the model supports tools + structured output natively, uses native JSON schema.
+- Otherwise, injects a synthetic `SetModelResponseTool` with parameters matching the
+  output schema, plus an instruction requiring the LLM to call it for its final answer.
+
+**Postprocess phase** (in `_postprocess_handle_function_calls_async`):
+- Detects calls to `set_model_response`.
+- Extracts the structured JSON from the tool arguments.
+- Creates a final model response event with the structured output.
+- This event satisfies `is_final_response()`, terminating the ReAct loop.
+
+---
+
+## 22. Flow Variants: SingleFlow vs AutoFlow
 
 ### SingleFlow
 
@@ -738,14 +1035,15 @@ Basic ReAct loop with tools but no agent transfer:
 
 Extends `SingleFlow` with agent transfer:
 
-- Adds `agent_transfer` request processor
+- Adds `agent_transfer` request processor (total: 12 request processors)
+- Same 2 response processors as SingleFlow
 - Enables `transfer_to_agent` tool in LLM requests
 - Handles agent delegation in postprocessing
 - Selected when: agent has sub-agents OR transfer is allowed
 
 ---
 
-## 14. End-to-End Execution Example
+## 23. End-to-End Execution Example
 
 Consider a user asking: *"What's the weather in New York?"*
 
@@ -808,7 +1106,7 @@ Consider a user asking: *"What's the weather in New York?"*
 
 ---
 
-## 15. Key File Reference
+## 24. Key File Reference
 
 | File | Purpose |
 |---|---|
@@ -840,3 +1138,20 @@ Consider a user asking: *"What's the weather in New York?"*
 | `src/google/adk/agents/sequential_agent.py` | SequentialAgent: runs sub-agents in order |
 | `src/google/adk/agents/parallel_agent.py` | ParallelAgent: runs sub-agents concurrently |
 | `src/google/adk/agents/loop_agent.py` | LoopAgent: repeats sub-agents in a loop |
+| `src/google/adk/plugins/base_plugin.py` | BasePlugin: plugin interface definition |
+| `src/google/adk/plugins/plugin_manager.py` | PluginManager: plugin execution with early-exit pattern |
+| `src/google/adk/planners/built_in_planner.py` | BuiltInPlanner: native model thinking integration |
+| `src/google/adk/planners/plan_re_act_planner.py` | PlanReActPlanner: prompt-based planning with tag parsing |
+| `src/google/adk/flows/llm_flows/_nl_planning.py` | Planning request/response processors |
+| `src/google/adk/flows/llm_flows/_code_execution.py` | Code execution request/response processors |
+| `src/google/adk/flows/llm_flows/_output_schema_processor.py` | Output schema enforcement via synthetic tool |
+| `src/google/adk/flows/llm_flows/basic.py` | Basic request processor: model name, config merging |
+| `src/google/adk/flows/llm_flows/identity.py` | Identity request processor: agent name/description injection |
+| `src/google/adk/flows/llm_flows/context_cache_processor.py` | Context caching configuration |
+| `src/google/adk/flows/llm_flows/interactions_processor.py` | Stateful Interactions API chaining |
+| `src/google/adk/flows/llm_flows/auth_preprocessor.py` | Authentication credential resolution |
+| `src/google/adk/flows/llm_flows/request_confirmation.py` | Tool confirmation preprocessing |
+| `src/google/adk/apps/compaction.py` | Event compaction: sliding window summarization |
+| `src/google/adk/utils/run_config.py` | RunConfig: max_llm_calls, streaming mode, tool thread pool |
+| `src/google/adk/auth/credential_manager.py` | CredentialManager: tool authentication lifecycle |
+| `src/google/adk/tools/tool_confirmation.py` | ToolConfirmation: user approval data model |
